@@ -2,12 +2,14 @@
 from flask_wtf import FlaskForm
 from wtforms import StringField, SubmitField, SelectField, \
     IntegerField, BooleanField, PasswordField, Form, FieldList, \
-    FormField, HiddenField, FloatField
-from wtforms.validators import DataRequired, ValidationError, IPAddress
+    FormField, HiddenField, FloatField, RadioField, IntegerRangeField
+from wtforms.validators import DataRequired, ValidationError, IPAddress, InputRequired
 from os import path
 import arm.config.config as cfg
 from arm.ui import app
-import json
+import arm.ui.utils as ui_utils
+
+### Custom Validators
 
 def validate_path_exists(form, field):
     if not path.exists(field.data):
@@ -27,6 +29,25 @@ def validate_umask(form, field):
     except ValueError:
         raise ValidationError("Invalid octal number format.")
 
+def validate_non_manditory_string(form, field):
+    originalLength = len(field.data)
+    if originalLength > 0:
+        text = field.data.replace('<p>','').replace('</p>','').replace('&nbsp;','')\
+                         .replace('&ensp;','').replace('&emsp;','').replace('<br>','')
+        if len(text) == 0:
+            raise ValidationError("Field must not contain only HTML tags.")
+        # check for non-ASCII characters
+        if not all(ord(c) < 128 for c in text):
+            raise ValidationError("Field must not contain non-ASCII characters.")
+        # check for non-printable characters
+        if not all(c.isprintable() for c in text):
+            raise ValidationError("Field must not contain non-printable characters.")
+        # remove whitespace
+        text = text.strip().replace("\t","").replace("\n","").replace("\r","").replace("\f","").replace("\v","")
+        if len(text) == 0:
+            raise ValidationError("Field must not contain only whitespace.")
+
+
 class TitleSearchForm(FlaskForm):
     """Main title search form used on pages\n
       - /titlesearch
@@ -44,60 +65,74 @@ class ChangeParamsForm(FlaskForm):
     DISCTYPE = SelectField('Disc Type: ', choices=[('dvd', 'DVD'), ('bluray', 'Blu-ray'),
                                                    ('music', 'Music'), ('data', 'Data')])
     # "music", "dvd", "bluray" and "data"
-    MAINFEATURE = BooleanField('Main Feature: ', DataRequired())
-    MINLENGTH = IntegerField('Minimum Length: ', DataRequired())
-    MAXLENGTH = IntegerField('Maximum Length: ', DataRequired())
+    MAINFEATURE = BooleanField(label='Main Feature: ', validators=[DataRequired()])
+    MINLENGTH = IntegerField(label='Minimum Length: ', validators=[DataRequired()])
+    MAXLENGTH = IntegerField(label='Maximum Length: ', validators=[DataRequired()])
     submit = SubmitField('Submit')
 
-ripperSettingsConfigFile = '/opt/arm/arm/ui/ripperFormConfig.json'
-def SettingsForm(postRequestDict=None):
+def SettingsForm() -> FlaskForm:
+    """ A Function that returns a class instance.
+        It buids the class based on on the comments.json and RipperFormConfig
+        (Comments.json to make sure a central location exists for user comments)
+        The SettingsForm class is originally empty, but fields are added using setattr
+        ripperFormConfig should have a dict per field: 
+            defaultForInternalUse (Default / field value type indicator): 
+            commentForInternalUse: included in the ripperFormConfig to make it easier to design the form in json.
+            dataValidation: DataRequired, ValidationError, IPAddress, \
+                InputRequired, validate_non_manditory_string, validate_umask, validate_path_exists
+            **formFieldType**: RadioField (Experimental), SelectField, IntegerField, \ 
+                FloatField (Untested), StringField
+
+    Raises:
+        Exception: Unknown FIeld type
+
+    Returns:
+        FlaskForm: SettingsForm
+    """
     class SettingsForm(FlaskForm):
         submit = SubmitField('Submit')
     
-    with open(ripperSettingsConfigFile, 'r') as ripperFormConfig:
-        dictFormFields = json.load(ripperFormConfig)
-    # request.form.to_dict() returns a dict with the form fields and the value. All as strings on empty.
-    # so we need to return a form with default values populated
-    # postRequestDict
+    
+    dictFormFields = ui_utils.generate_ripperFormSettings()
+    comments = ui_utils.generate_comments()
+    
 
     for key, value in dictFormFields.items():
-        if postRequestDict is not None:
-            if key == 'csrf_token':
-                # Skip the CSRF token field
-                continue
-        #Infer the type of form field based on the value type
-        app.logger.debug(f"Inferring form field type for {key}: {type(value)}")
-        # ripperFormConfig should have a dict per field: default, comment, dataValidation, formFieldType
-        commentValue = dictFormFields[key]["comment"]
-        if commentValue is None: commentValue = ""
-        if postRequestDict is not None:
-            fieldDefault = postRequestDict[key]
+        # #Infer the type of form field based on the value type
+        # app.logger.debug(f"Inferring form field type for {key}: {type(value['defaultForInternalUse'])}")
+        # 
+        if key in comments:
+            commentValue = comments[key]
         else:
-            fieldDefault = dictFormFields[key]["default"]
+            app.logger.warning(f"Comment not found for {key}, using empty string")
+            commentValue = ""
         if commentValue is None: commentValue = ""
-        fieldType = dictFormFields[key]["formFieldType"]
+        fieldDefault = value["defaultForInternalUse"]
+        fieldType = value["formFieldType"]
         # The next is a bit tricky, getting a list of data validations, setting them up as objects
         # or functions depending on what was passed
-        if isinstance(dictFormFields[key]['dataValidation'], list) and len(dictFormFields[key]['dataValidation']) > 0:
-            validators = dictFormFields[key]['dataValidation']
-            for x in validators:
+        # app.logger.debug(f"commentValue: {commentValue}, fieldDefault: {fieldDefault}, fieldType: {fieldType}")
+        if isinstance(value['dataValidation'], list) and len(value['dataValidation']) > 0:
+            possible_validators = value['dataValidation']
+            validators = []
+            # DataRequired, ValidationError, IPAddress, validate_path_exists, validate_umask validate_non_manditory_string
+            for x in possible_validators:
                 if x == "validate_path_exists":
-                    validators.remove(x)
                     validators.append(validate_path_exists)
                 elif x == "validate_umask":
-                    validators.remove(x)
                     validators.append(validate_umask)
+                elif x == "validate_non_manditory_string":
+                    validators.append(validate_non_manditory_string)
                 else:
                     try:
                         n_v_c = globals()[x]
                         n_v_c = n_v_c()
-                        validators.remove(x)
                         validators.append(n_v_c)
                     except Exception as e:
                         app.logger.warning(f"Error adding validator {x} to {key}: {e}")
+            app.logger.debug(f"validators: {validators}")
         else:
             validators = None
-        
 
         if isinstance(fieldDefault, bool) and fieldType == "SelectField":
             f = SelectField(label=key.replace("_", " "),
@@ -110,8 +145,30 @@ def SettingsForm(postRequestDict=None):
                             ('False', 'False')
                             ],
                         )
+        elif isinstance(fieldDefault, bool) and fieldType == "RadioField":
+            f = RadioField(label=key.replace("_", " "),
+                        description=commentValue,
+                        default=str(fieldDefault).title(),
+                        render_kw={'title':commentValue},
+                        validators=validators,
+                        choices=[
+                            ('True', 'True'),
+                            ('False', 'False')
+                            ],
+                        )
+        elif fieldType == "RadioFeild":
+            # SelectField with a list of choices
+            paired_list = ui_utils.listCoPairedIntoTuple(fieldDefault)
+            f = RadioField(label=key.replace("_", " "),
+                        description=commentValue,
+                        # default=str(fieldDefault),
+                        render_kw={'title':commentValue},
+                        validators=validators,
+                        choices=paired_list,
+                        )
         elif fieldType == "SelectField":
-            paired_list = [(x, x) for x in fieldDefault]
+            # SelectField with a list of choices
+            paired_list = ui_utils.listCoPairedIntoTuple(fieldDefault)
             f = SelectField(label=key.replace("_", " "),
                         description=commentValue,
                         # default=str(fieldDefault),
@@ -142,6 +199,7 @@ def SettingsForm(postRequestDict=None):
                         )
         else:
             app.logger.warning(f"Unknown type for {key}: {type(value)}, returning StringField")
+            raise Exception(f"Unknown type for {key}: {type(value)}, returning StringField")
         setattr(SettingsForm, key, f)
     return SettingsForm()
 
